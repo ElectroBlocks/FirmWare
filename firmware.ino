@@ -4,7 +4,7 @@
 #include <SoftwareSerial.h>
 #include <DHT11.h>
 #include <Adafruit_NeoPixel.h>
-#include "TinyIRReceiver.h"
+#include "IRLremote.h"
 #include <Stepper.h>
 #include <avr/wdt.h>
 #include <Wire.h>
@@ -42,6 +42,7 @@ LedControl* ledMatrix = nullptr;
 SoftwareSerial * bluetoothSerial = nullptr;
 SoftwareSerial * rfidSerial = nullptr;
 DHT11 * tempSensor = nullptr;
+CNec IRLremote;
 
 // ===================== PIN MANAGER =====================
 namespace PinManager {
@@ -126,6 +127,7 @@ enum ComponentType : uint8_t {
   COMP_UNKNOWN = 0,
   // Raw I/O
   COMP_DIGITAL_IN,   // dr
+  COMP_BUTTON,       // bt
   COMP_DIGITAL_OUT,  // dw
   COMP_ANALOG_IN,    // ar
   COMP_PWM_OUT,      // aw
@@ -202,6 +204,27 @@ struct Token {
     toBuffer(buf, sizeof(buf));
     return strtol(buf, nullptr, 0);
   }
+
+  int asPin() const {
+    if (!valid()) return -1;
+    char buf[21];
+    toBuffer(buf, sizeof(buf));
+
+    // Check for analog pins "A0".."A5"
+    if (buf[0] == 'A' || buf[0] == 'a') {
+      int analogIdx = atoi(buf + 1);  // parse after 'A'
+#if defined(ARDUINO_AVR_UNO) || defined(ARDUINO_AVR_NANO)
+      return analogIdx + 14;          // UNO/Nano analog pins start at 14
+#elif defined(ARDUINO_AVR_MEGA2560)
+      return analogIdx + 54;          // Mega analog pins start at 54
+#else
+      return analogIdx;               // fallback: return index itself
+#endif
+    }
+
+    // Otherwise treat as digital pin number
+    return atoi(buf);
+  }
 };
 
 // Then declare the function that returns Token
@@ -238,43 +261,27 @@ void freeServo(int idx) {
   if (idx >= 0 && idx < MAX_SERVO) gServoUsed[idx] = false;
 }
 
+// MOTORS
 
-//== == == == == == == == == == = IR REMOTE == == == == == == == == == == =
-// Globals to hold last code (set by callback)
-volatile uint16_t g_irAddr = 0;
-volatile uint8_t g_irCmd = 0;
-volatile bool g_irRepeat = false;
-volatile bool g_irHasNew = false;
-
-// Required callback
-void handleReceivedTinyIRData(uint16_t aAddress, uint8_t aCommand, bool isRepeat) {
-  g_irAddr = aAddress;
-  g_irCmd = aCommand;
-  g_irRepeat = isRepeat;
-  g_irHasNew = true;
-}
-
-
-bool moveMotor(int speed, char direction, int pin1, int pin2, int enablePin) {
+bool moveMotor(uint8_t speed, uint8_t direction, uint8_t pin1, uint8_t pin2, uint8_t enablePin) {
   // Control the motor direction based on the specified direction
   if (speed > 255) {
     speed = 254;
   } else if (speed < 1) {
     speed = 1;
   }
-
   switch (direction) {
-    case 'c':
+    case 1: // clockwise
       digitalWrite(pin1, HIGH);  // Set pin1 high to turn clockwise
       digitalWrite(pin2, LOW); // Set pin2 low
       analogWrite(enablePin, speed);  // Set motor speed
       return true;
-    case 'a':
+    case 2: // anticlockwise
       digitalWrite(pin1, LOW); // Set pin1 low to turn anti-clockwise
       digitalWrite(pin2, HIGH); // Set pin2 high
       analogWrite(enablePin, speed); // Set motor speed
       return true;
-    case 's':
+    case 3: // stop
       analogWrite(enablePin, 0);  // Stop the motor
       return true;
   }
@@ -295,62 +302,7 @@ void hexToRGB(const char* hex, uint8_t& r, uint8_t& g, uint8_t& b){
   b = (hexNib(hex[4])<<4) | hexNib(hex[5]);
 }
 
-static inline int parseHexOrDec(const char* s, int fallback = 0) {
-  if (!s || !*s) return fallback;
-  if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) return (int)strtol(s, nullptr, 16);
-  return (int)strtol(s, nullptr, 10);
-}
-
 static inline bool isEmptyTok(const char* s) { return !s || *s == '\0'; }
-
-
-// Parse decimal ("123") or hex ("0x7B" / "0X7B") into uint8_t.
-// - Trims leading spaces, ignores a leading '+'.
-// - Returns `fallback` if no digits are found.
-// - Clamps to 0..255 on overflow.
-// - Optionally sets *ok to true on success.
-static inline uint8_t parseHexOrDec8(const char* s, uint8_t fallback = 0, bool* ok = nullptr) {
-  if (ok) *ok = false;
-  if (!s) return fallback;
-
-  // skip leading spaces
-  while (*s==' ' || *s=='\t' || *s=='\r' || *s=='\n') ++s;
-  if (*s=='\0') return fallback;
-
-  if (*s=='+') ++s;  // ignore leading '+'
-
-  // detect hex prefix
-  bool isHex = (s[0]=='0' && (s[1]=='x' || s[1]=='X'));
-  if (isHex) s += 2;
-
-  unsigned int v = 0;
-  bool any = false;
-
-  if (isHex) {
-    while (true) {
-      char c = *s;
-      int d = (c>='0'&&c<='9') ? (c-'0') :
-              (c>='a'&&c<='f') ? (c-'a'+10) :
-              (c>='A'&&c<='F') ? (c-'A'+10) : -1;
-      if (d < 0) break;
-      any = true;
-      v = (v<<4) | (unsigned)d;
-      if (v > 255U) v = 255U; // clamp
-      ++s;
-    }
-  } else {
-    while (*s >= '0' && *s <= '9') {
-      any = true;
-      v = v*10 + (unsigned)(*s - '0');
-      if (v > 255U) v = 255U; // clamp
-      ++s;
-    }
-  }
-
-  if (!any) return fallback;
-  if (ok) *ok = true;
-  return (uint8_t)v;
-}
 
 // Case-insensitive, minimal checks, tiny flash footprint
 static inline ComponentType parseComponentType(const char* t) {
@@ -361,6 +313,7 @@ static inline ComponentType parseComponentType(const char* t) {
   // Fast path: 2-letter codes
   if (t[0] && t[1] && !t[2]) {
     if (a=='d' && b=='r') return COMP_DIGITAL_IN;
+    if (a=='b' && b== 't') return COMP_BUTTON;
     if (a=='d' && b=='w') return COMP_DIGITAL_OUT;
     if (a=='a' && b=='r') return COMP_ANALOG_IN;
     if (a=='a' && b=='w') return COMP_PWM_OUT;
@@ -411,57 +364,13 @@ static inline ComponentType parseComponentType(const char* t) {
 
 
 
-
-String getParseValue(const String& data, int index) {
-  if (index < 0 || SEP_LEN == 0) return "";
-
-  int start = 0;
-  int token = 0;
-
-  // Skip to the start of the target token
-  while (token < index) {
-    int pos = data.indexOf(SEP, start);
-    if (pos < 0) return "";  // not enough tokens
-    start = pos + SEP_LEN;
-    ++token;
-  }
-
-  // Find end of the target token
-  int end = data.indexOf(SEP, start);
-  if (end < 0) end = data.length();  // last token goes to end
-
-  return data.substring(start, end);  // no trimming
-}
-
-inline const char* nextTok(const char** cursor, uint8_t* outLen) {
-  if (!cursor || !*cursor || !outLen) return nullptr;
-  const char* p = *cursor;
-  if (*p == '\0') { *outLen = 0; return nullptr; }
-
-  // Find the next "::" delimiter
-  const char* e = strstr(p, "::");
-  size_t len = e ? (size_t)(e - p) : strlen(p);
-
-  // Optional: trim one leading space
-  // if (len && *p == ' ') { ++p; --len; }
-
-  if (len > 20) len = 20; // enforce max length if needed
-
-  *outLen = (uint8_t)len;
-
-  // Advance cursor for the next call
-  *cursor = e ? (e + 2) : (p + len);
-
-  return p;
-}
-
-
 bool isSensorType(ComponentType t) {
-  return (t == COMP_DIGITAL_IN || t == COMP_ANALOG_IN || t == COMP_DHT || t == COMP_IR_TINY || t == COMP_JOYSTICK || t == COMP_ULTRASONIC || t == COMP_THERMISTOR);
+  return (t == COMP_DIGITAL_IN || t == COMP_ANALOG_IN || t == COMP_DHT || t == COMP_IR_TINY || t == COMP_JOYSTICK || t == COMP_ULTRASONIC || t == COMP_THERMISTOR || t == COMP_BUTTON);
 }
 const __FlashStringHelper* typeName(ComponentType t) {
   switch (t) {
     case COMP_DIGITAL_IN:   return F("dr");
+    case COMP_BUTTON:       return F("bt");
     case COMP_ANALOG_IN:    return F("ar");
     case COMP_DHT:          return F("dht");
     case COMP_IR_TINY:      return F("ir");
@@ -477,6 +386,15 @@ bool makeDigitalIn(Component& out, int pin) {
   if (!PinManager::reserve(pin, INPUT)) return false;
   out = {};
   out.type = COMP_DIGITAL_IN;
+  out.pins[0] = pin;
+  out.nPins = 1;
+  return true;
+}
+
+bool makeButton(Component& out, int pin) {
+  if (!PinManager::reserve(pin, INPUT_PULLUP)) return false;
+  out = {};
+  out.type = COMP_BUTTON;
   out.pins[0] = pin;
   out.nPins = 1;
   return true;
@@ -567,9 +485,8 @@ bool makeDHT(Component& out, int pin) {
   return true;
 }
 bool makeIRTiny(Component& out, int pin) {
-  if (!PinManager::reserve(pin, INPUT)) return false;
-  pinModeFast(pin, INPUT);
-  enablePCIInterruptForTinyReceiver();
+  if (!PinManager::reserve(pin)) return false;
+  IRLremote.begin(pin);
   out = {};
   out.type = COMP_IR_TINY;
   out.pins[0] = pin;
@@ -580,21 +497,19 @@ bool makeIRTiny(Component& out, int pin) {
 bool makeMotor(Component& out, const String& payload)
 {
   const char * command = payload.c_str();
-  uint8_t cursor;
-  nextTok(&command, &cursor);
-  int en1Pin = PinManager::lookup(nextTok(&command, &cursor));
-  int in1Pin = PinManager::lookup(nextTok(&command, &cursor));
-  int in2Pin = PinManager::lookup(nextTok(&command, &cursor));
+  nextToken(&command);
+  int en1Pin = nextToken(&command).asPin();
+  int in1Pin = nextToken(&command).asPin();
+  int in2Pin = nextToken(&command).asPin();
   out = {};
   if (!PinManager::reserve(en1Pin, OUTPUT)) return false;
   if (!PinManager::reserve(in1Pin, OUTPUT)) return false;
   if (!PinManager::reserve(in2Pin, OUTPUT)) return false;
-  const char* enPin2 = nextTok(&command, &cursor);
-  int numberMotors = !isEmptyTok(enPin2) ? 2 : 1;
+  int en2Pin = nextToken(&command).asPin();
+  int numberMotors = en2Pin > 0 ? 2 : 1;
   if (numberMotors == 2) {
-    int en2Pin = PinManager::lookup(enPin2);
-    int in3Pin = PinManager::lookup(nextTok(&command, &cursor));
-    int in4Pin = PinManager::lookup(nextTok(&command, &cursor));
+    int in3Pin = nextToken(&command).asPin();
+    int in4Pin = nextToken(&command).asPin();
     if (!PinManager::reserve(en2Pin, OUTPUT)) return false;
     if (!PinManager::reserve(in3Pin, OUTPUT)) return false;
     if (!PinManager::reserve(in4Pin, OUTPUT)) return false;
@@ -614,10 +529,9 @@ bool makeMotor(Component& out, const String& payload)
 bool makeTM(Component& out, const String& payload)
 {
   const char * command = payload.c_str();
-  uint8_t cursor;
-  nextTok(&command, &cursor);
-  int dioPin = PinManager::lookup(nextTok(&command, &cursor));
-  int clkPin = PinManager::lookup(nextTok(&command, &cursor));
+  nextToken(&command);
+  int dioPin = nextToken(&command).asPin();
+  int clkPin = nextToken(&command).asPin();
   if (!PinManager::reserve(dioPin) || !PinManager::reserve(clkPin)) {
     return false;
   }
@@ -637,11 +551,10 @@ bool makeTM(Component& out, const String& payload)
 
 bool makeSoftUart(Component& out, ComponentType t, const String& payload) {
   const char * command = payload.c_str();
-  uint8_t cursor;
-  nextTok(&command, &cursor);
-  int rx = PinManager::lookup(nextTok(&command, &cursor));
-  int tx = PinManager::lookup(nextTok(&command, &cursor));
-  int baud = parseHexOrDec(nextTok(&command, &cursor), 0);;
+  nextToken(&command);
+  int rx = nextToken(&command).asPin();
+  int tx = nextToken(&command).asPin();
+  int baud = nextToken(&command).asInt();
   if (!PinManager::reserve(rx, INPUT) || !PinManager::reserve(tx, OUTPUT)) {
     if (PinManager::valid(rx)) PinManager::release(rx);
     if (PinManager::valid(tx)) PinManager::release(tx);
@@ -666,16 +579,15 @@ bool makeSoftUart(Component& out, ComponentType t, const String& payload) {
 }
 bool makeStepper(Component& out, const String& payload) {
   const char * command = payload.c_str();
-  uint8_t cursor;
-  nextTok(&command, &cursor);
+  nextToken(&command);
 
-  int pin1 = PinManager::lookup(nextTok(&command, &cursor));
-  int pin2 = PinManager::lookup(nextTok(&command, &cursor));
-  int pin3 = PinManager::lookup(nextTok(&command, &cursor));
-  int pin4 = PinManager::lookup(nextTok(&command, &cursor));
+  int pin1 = nextToken(&command).asPin();
+  int pin2 = nextToken(&command).asPin();
+  int pin3 = nextToken(&command).asPin();
+  int pin4 = nextToken(&command).asPin();
 
-  int steps = parseHexOrDec(nextTok(&command, &cursor), 0);
-  int speed = parseHexOrDec(nextTok(&command, &cursor), 0);
+  int steps = nextToken(&command).asInt();
+  int speed = nextToken(&command).asInt();
 
   if (!PinManager::reserve(pin1, OUTPUT) || !PinManager::reserve(pin2, OUTPUT) || !PinManager::reserve(pin3, OUTPUT) || !PinManager::reserve(pin4, OUTPUT)) {
     if (PinManager::valid(pin1)) PinManager::release(pin1);
@@ -722,10 +634,9 @@ static inline uint8_t neoTypeFromCode(uint8_t code) {
 bool makePassiveBuzzer(Component& out, const String& payload)
 {
   const char * command = payload.c_str();
-  uint8_t cursor;
-  nextTok(&command, &cursor);
+  nextToken(&command);
 
-  int buzzerPin = PinManager::lookup(nextTok(&command, &cursor));
+  int buzzerPin = nextToken(&command).asPin();
   if (!PinManager::reserve(buzzerPin)) {
     return false;
   }
@@ -741,9 +652,9 @@ bool makeRGB(Component& out, const String& payload)
 {
   const char * command = payload.c_str();
   nextToken(&command);
-  int redPin = nextToken(&command).asInt();
-  int greenPin = nextToken(&command).asInt();
-  int bluePin = nextToken(&command).asInt();
+  int redPin = nextToken(&command).asPin();
+  int greenPin = nextToken(&command).asPin();
+  int bluePin = nextToken(&command).asPin();
   if (!PinManager::reserve(redPin, OUTPUT)) return false;
   if (!PinManager::reserve(greenPin, OUTPUT)) return false;
   if (!PinManager::reserve(bluePin, OUTPUT)) return false;
@@ -760,13 +671,12 @@ bool makeRGB(Component& out, const String& payload)
 // LED strip (see note about template pin below)
 bool makeLEDStrip(Component& out, int pin, const String& payload) {
   const char * command = payload.c_str();
-  uint8_t cursor;
-  nextTok(&command, &cursor);
-
-  int count = parseHexOrDec(nextTok(&command, &cursor), 0);
-  uint8_t code = parseHexOrDec8(nextTok(&command, &cursor), 0x81);  // default GRB@800k
+  nextToken(&command);
+  nextToken(&command);
+  int count = nextToken(&command).asInt();
+  uint8_t code = nextToken(&command).asInt();  // default GRB@800k
   uint8_t type = neoTypeFromCode(code);
-  int brightness = parseHexOrDec(nextTok(&command, &cursor), 0);
+  uint8_t brightness = nextToken(&command).asInt();
   if (count <= 0 || count > MAX_LEDS) return false;
   if (!PinManager::reserve(pin, OUTPUT)) return false;
 
@@ -787,13 +697,11 @@ bool makeLEDStrip(Component& out, int pin, const String& payload) {
 
 bool makeLedMatrix(Component& out, const String& payload) {
   const char * command = payload.c_str();
-  uint8_t cursor;
-  nextTok(&command, &cursor);
+  nextToken(&command);
 
-  int dinPin = PinManager::lookup(nextTok(&command, &cursor));
-  int csPin = PinManager::lookup(nextTok(&command, &cursor));
-  int clkPin = PinManager::lookup(nextTok(&command, &cursor));
-
+  int dinPin = nextToken(&command).asInt();
+  int csPin = nextToken(&command).asInt();
+  int clkPin = nextToken(&command).asInt();
   if (!PinManager::reserve(dinPin, OUTPUT)) return false;
   if (!PinManager::reserve(csPin, OUTPUT)) return false;
   if (!PinManager::reserve(clkPin, OUTPUT)) return false;
@@ -804,7 +712,6 @@ bool makeLedMatrix(Component& out, const String& payload) {
   ledMatrix->setIntensity(0, 8);
   /* and clear the display */
   ledMatrix->clearDisplay(0);
-  ledMatrix->setLed(0, 1, 1, true);
 
   out = {};
   out.type = COMP_LED_MATRIX;
@@ -819,12 +726,11 @@ bool makeLedMatrix(Component& out, const String& payload) {
 // Joystick: ax (A), ay (A), sw (D)
 bool makeJoystick(Component& out, const String& payload) {
   const char * command = payload.c_str();
-  uint8_t cursor;
-  nextTok(&command, &cursor);
+  nextToken(&command);
 
-  int axPin = PinManager::lookup(nextTok(&command, &cursor));
-  int ayPin = PinManager::lookup(nextTok(&command, &cursor));
-  int swPin = PinManager::lookup(nextTok(&command, &cursor));
+  int axPin = nextToken(&command).asPin();
+  int ayPin = nextToken(&command).asPin();
+  int swPin = nextToken(&command).asPin();
 
   if (!PinManager::reserve(axPin, 0xFF, true)) return false;
   if (!PinManager::reserve(ayPin, 0xFF, true)) {
@@ -849,11 +755,10 @@ bool makeJoystick(Component& out, const String& payload) {
 // Ultrasonic (HC-SR04): trig, echo
 bool makeUltrasonic(Component& out, const String& payload) {
   const char * command = payload.c_str();
-  uint8_t cursor;
-  nextTok(&command, &cursor);
+  nextToken(&command);
 
-  int trig = PinManager::lookup(nextTok(&command, &cursor));
-  int echo = PinManager::lookup(nextTok(&command, &cursor));
+  int trig = nextToken(&command).asPin();
+  int echo = nextToken(&command).asPin();
 
   if (!PinManager::reserve(trig, OUTPUT)) return false;
   if (!PinManager::reserve(echo, INPUT)) {
@@ -873,9 +778,9 @@ bool makeThermistor(Component& out, const String& payload)
 {
   const char * command = payload.c_str();
   uint8_t cursor;
-  nextTok(&command, &cursor);
+  nextToken(&command);
 
-  int apin = PinManager::lookup(nextTok(&command, &cursor));
+  int apin = nextToken(&command).asPin();
   if (!PinManager::reserve(apin, 0xFF, true)) return false;
   out = {};
   out.type = COMP_THERMISTOR;
@@ -900,7 +805,15 @@ bool cmdSense() {
           int pin = c.pins[0];
           Serial.print(pin);
           Serial.print(':');
-          Serial.print(digitalRead(pin));
+          Serial.print(digitalRead(pin) ? F("1") : F("0"));
+        }
+        break;
+      case COMP_BUTTON:
+        {
+          int pin = c.pins[0];
+          Serial.print(pin);
+          Serial.print(':');
+          Serial.print(digitalRead(pin) == LOW ? F("1") : F("0"));
         }
         break;
 
@@ -929,25 +842,13 @@ bool cmdSense() {
       case COMP_IR_TINY:
         {
           int pin = c.pins[0];
-          Serial.print(F("irt:"));  // type tag
           Serial.print(pin);     // pin
           Serial.print(':');
-          if (g_irHasNew) {
-            noInterrupts();
-            uint16_t addr = g_irAddr;
-            uint8_t cmd = g_irCmd;
-            bool rep = g_irRepeat;
-            g_irHasNew = false;  // consume
-            interrupts();
-            Serial.print(F("0x"));
-            Serial.print(addr, HEX);
-            Serial.print(':');
-            Serial.print(F("0x"));
-            Serial.print(cmd, HEX);
-            Serial.print(':');
-            Serial.print(rep ? 1 : 0);
-          } else {
-            Serial.print(F("NONE"));
+          
+          if (IRLremote.available())
+          {
+            auto data = IRLremote.read();
+            Serial.print(data.command);
           }
         }
         break;
@@ -965,7 +866,7 @@ bool cmdSense() {
           Serial.print(':');
           Serial.print(sw);
           Serial.print(':');
-          Serial.print(digitalRead(sw));
+          Serial.print(digitalRead(sw) ? F("1") : F("0"));
         }
         break;
 
@@ -1013,7 +914,7 @@ bool cmdSense() {
     }
     Serial.print(';');
   }
-  Serial.println('|');
+  Serial.println(F("SENSE_COMPLETE"));
 
   return true;
 }
@@ -1121,7 +1022,7 @@ bool commandStepper(Component& component, const String& payload) {
   nextToken(&command);
   nextToken(&command);
 
-  uint8_t steps = nextToken(&command).asInt();
+  int steps = nextToken(&command).asInt();
   stepperMotor->step(steps);
   return true;
 }
@@ -1129,78 +1030,80 @@ bool commandStepper(Component& component, const String& payload) {
 bool commandLedStrip(Component& component, const String& payload)
 {
   const char * command = payload.c_str();
-  uint8_t cursor;
-  nextTok(&command, &cursor);
-  nextTok(&command, &cursor);
+  nextToken(&command);
+  nextToken(&command);
 
-  uint8_t option = parseHexOrDec(nextTok(&command, &cursor), 0);
+  uint8_t option = nextToken(&command).asInt();
   if (option == 1)
   {
     neoPixel->show();
     return true;
   }
-  for (int ledNum = 0; ledNum < component.param[0]; ledNum += 1) 
-  {
-    uint8_t r, g, b;
-    const char * color =  nextTok(&command, &cursor);
-    if (isEmptyTok(color)) break;
-    hexToRGB(color, r, g, b);
-    neoPixel->setPixelColor(ledNum, r, g, b);
-  }
+  uint8_t r, g, b;
+  char color[20];
+  uint8_t position = nextToken(&command).asInt();
+  Token colorToken =  nextToken(&command);
+  colorToken.toBuffer(color, sizeof(color));
+  hexToRGB(color, r, g, b);
+  neoPixel->setPixelColor(position, r, g, b);
+
   return true;
 }
 
 bool commandLedMatrix(Component& component, const String& payload)
 {
     const char * command = payload.c_str();
-    uint8_t cursor;
-    nextTok(&command, &cursor);
-    nextTok(&command, &cursor);
+    nextToken(&command);
+    nextToken(&command);
 
-    uint8_t option = parseHexOrDec(nextTok(&command, &cursor), 0);
+    uint8_t option = nextToken(&command).asInt();
     if (option == 1) 
     {
-      int row = parseHexOrDec(nextTok(&command, &cursor), 0);
-      int col = parseHexOrDec(nextTok(&command, &cursor), 0);
-      bool isOn = parseHexOrDec(nextTok(&command, &cursor), 0) == 1;
+      int row = nextToken(&command).asInt();
+      int col = nextToken(&command).asInt();
+      bool isOn = nextToken(&command).asInt() == 1;
       ledMatrix->setLed(0, row, col, isOn);
       return true;
     }
 
-    ledMatrix->setRow(0, 0, parseHexOrDec(nextTok(&command, &cursor), 0));
-    ledMatrix->setRow(0, 1, parseHexOrDec(nextTok(&command, &cursor), 0));
-    ledMatrix->setRow(0, 2, parseHexOrDec(nextTok(&command, &cursor), 0));
-    ledMatrix->setRow(0, 3, parseHexOrDec(nextTok(&command, &cursor), 0));
-    ledMatrix->setRow(0, 4, parseHexOrDec(nextTok(&command, &cursor), 0));
-    ledMatrix->setRow(0, 5, parseHexOrDec(nextTok(&command, &cursor), 0));
-    ledMatrix->setRow(0, 6, parseHexOrDec(nextTok(&command, &cursor), 0));
-    ledMatrix->setRow(0, 7, parseHexOrDec(nextTok(&command, &cursor), 0));
+    ledMatrix->setRow(0, 0, nextToken(&command).asInt());
+    ledMatrix->setRow(0, 1, nextToken(&command).asInt());
+    ledMatrix->setRow(0, 2, nextToken(&command).asInt());
+    ledMatrix->setRow(0, 3, nextToken(&command).asInt());
+    ledMatrix->setRow(0, 4, nextToken(&command).asInt());
+    ledMatrix->setRow(0, 5, nextToken(&command).asInt());
+    ledMatrix->setRow(0, 6, nextToken(&command).asInt());
+    ledMatrix->setRow(0, 7, nextToken(&command).asInt());
     return true;
 }
 
 bool commandMotor(Component& component, const String& payload)
 {
     const char * command = payload.c_str();
-    uint8_t cursor;
-    nextTok(&command, &cursor);
-    nextTok(&command, &cursor);
-    int whichMotor = parseHexOrDec(nextTok(&command, &cursor), 0);
-    int speed = parseHexOrDec(nextTok(&command, &cursor), 0);
-    const char * direction = nextTok(&command, &cursor);
-    int enablePin = whichMotor == 1 ? component.pins[0] : component.pins[3];
-    int pin1 = whichMotor == 1 ? component.pins[1] : component.pins[4];
-    int pin2 = whichMotor == 1 ? component.pins[2] : component.pins[5];
+    nextToken(&command);
+    nextToken(&command);
+    uint8_t whichMotor = nextToken(&command).asInt();
+    uint8_t speed = nextToken(&command).asInt();
+    uint8_t direction = nextToken(&command).asInt();
+    uint8_t enablePin = whichMotor == 1 ? component.pins[0] : component.pins[3];
+    uint8_t pin1 = whichMotor == 1 ? component.pins[1] : component.pins[4];
+    uint8_t pin2 = whichMotor == 1 ? component.pins[2] : component.pins[5];
     return moveMotor(speed, direction, pin1, pin2, enablePin);
 }
 
 bool commandTmDisplay(Component& component, const String& payload)
 {
   const char * command = payload.c_str();
-  uint8_t cursor;
-  nextTok(&command, &cursor);
-  nextTok(&command, &cursor);
-  bool colonOn = parseHexOrDec(nextTok(&command, &cursor), 0) == 1;
-  const char * message = nextTok(&command, &cursor);
+  nextToken(&command);
+  nextToken(&command);
+  bool colonOn = nextToken(&command).asInt() == 1;
+  char messageChar[10];
+  Token messageToken = nextToken(&command);
+  messageToken.toBuffer(messageChar, sizeof(messageChar));
+  const char* message = messageChar;
+  if (isEmptyTok(message)) {
+    message = "    ";
+  }
   if (colonOn)
   {
     tm->colonOn();
@@ -1214,10 +1117,10 @@ bool commandTmDisplay(Component& component, const String& payload)
 bool commandBuzzer(Component& component, int pin, const String& payload)
 {
     const char * command = payload.c_str();
-    uint8_t cursor;
-    nextTok(&command, &cursor);
-    nextTok(&command, &cursor);
-    int note = parseHexOrDec(nextTok(&command, &cursor), 0);
+    nextToken(&command);
+    nextToken(&command);
+    
+    int note = nextToken(&command).asInt();
     if (note == 0) {
       noTone(pin);
     } else {
@@ -1230,11 +1133,11 @@ bool commandBuzzer(Component& component, int pin, const String& payload)
 bool commandBluetooth(Component& component, const String& payload)
 {
   const char * command = payload.c_str();
-  uint8_t cursor;
-  nextTok(&command, &cursor);
-  nextTok(&command, &cursor);
-  const char* message = nextTok(&command, &cursor);
-  bluetoothSerial->println(message);
+  nextToken(&command);
+  nextToken(&command);
+  char m[30];
+  nextToken(&command).toBuffer(m, sizeof(m));
+  bluetoothSerial->println(m);
   return true;
 }
 
@@ -1254,13 +1157,9 @@ bool commandRGB(Component& component, const String& payload)
 bool cmdWrite(const String& payload) {
   const char * command = payload.c_str();
   char type[21];
-  char pinName[21];
   Token typeToken = nextToken(&command);
   typeToken.toBuffer(type, sizeof(type));
-  Token pinToken = nextToken(&command);
-  pinToken.toBuffer(pinName, sizeof(pinName));
-  int pin = PinManager::lookup(pinName);
-
+  int pin = nextToken(&command).asPin();
   ComponentType ct = parseComponentType(type);
   if (pin < 0) return false;
   int idx = CM.findByPin(pin);
@@ -1296,19 +1195,17 @@ bool handleRegister(const String& payload) {
   char pinName[21];
   Token typeToken = nextToken(&command);
   typeToken.toBuffer(type, sizeof(type));
-  Token pinToken = nextToken(&command);
-  pinToken.toBuffer(pinName, sizeof(pinName));
+  int pin = nextToken(&command).asPin();
   if (!type || !*type) return false;
 
   ComponentType ct = parseComponentType(type);
-  // Many makers use pin from token 1; others parse pins from payload inside makeX
-  int pin = PinManager::lookup(pinName);
 
   Component component;
   bool ok = false;
 
   switch (ct) {
     case COMP_DIGITAL_IN:    ok = makeDigitalIn(component, pin);                 break;
+    case COMP_BUTTON:        ok = makeButton(component, pin);                 break;
     case COMP_DIGITAL_OUT:   ok = makeDigitalOut(component, pin);                break;
     case COMP_ANALOG_IN:     ok = makeAnalogIn(component, pin);                  break;
     case COMP_PWM_OUT:       ok = makePWMOut(component, pin);                    break;
@@ -1362,7 +1259,7 @@ void printSuccessFailed(bool success)
 void handleLine(const String& raw) {
   String line = raw;
   line.trim();
-  bool ok = true;
+  bool ok = false;
   if (!line.length()) return;
 
   if (line.equalsIgnoreCase("sense")) {
@@ -1392,6 +1289,7 @@ void setup()
   Serial.setTimeout(30);     // small, so blocking is bounded
   delay(50);
   PinManager::begin();
+  Serial.println("System:READY");
 }
 
 void loop() {
