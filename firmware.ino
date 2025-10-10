@@ -2,7 +2,7 @@
 #include <Servo.h>
 #include <LiquidCrystal_I2C.h>
 #include <SoftwareSerial.h>
-#include <DHT11.h>
+#include <DHT.h>
 #include <Adafruit_NeoPixel.h>
 #include "IRLremote.h"
 #include <Stepper.h>
@@ -43,7 +43,7 @@ TM1637* tm = nullptr;
 LedControl* ledMatrix = nullptr;
 SoftwareSerial* bluetoothSerial = nullptr;
 SoftwareSerial* rfidSerial = nullptr;
-DHT11* tempSensor = nullptr;
+DHT* tempSensor = nullptr;
 CNec IRLremote;
 
 // ===================== PIN MANAGER =====================
@@ -443,6 +443,41 @@ static inline bool isEmptyTok(const char* s) {
   return !s || *s == '\0';
 }
 
+char* analogName(int pinNumber, char* out, uint8_t n) {
+  // Ensure n >= 3 for "A0", >= 4 for "A15", >= 6 for big "69"
+  if (pinNumber >= 14 && pinNumber <= 19) {
+    // Uno/Nano A0..A5
+    if (n >= 3) {
+      out[0] = 'A';
+      out[1] = char('0' + (pinNumber - 14));
+      out[2] = '\0';
+    }
+    return out;
+  }
+  if (pinNumber >= 54 && pinNumber <= 69) {
+    // Mega A0..A15
+    uint8_t idx = pinNumber - 54;  // 0..15
+    if (idx < 10) {
+      if (n >= 3) {
+        out[0] = 'A';
+        out[1] = char('0' + idx);
+        out[2] = '\0';
+      }
+    } else {
+      if (n >= 4) {
+        out[0] = 'A';
+        out[1] = '1';
+        out[2] = char('0' + (idx - 10));
+        out[3] = '\0';
+      }
+    }
+    return out;
+  }
+  // Fallback: just the number (no printf)
+  itoa(pinNumber, out, 10);
+  return out;
+}
+
 // Case-insensitive, minimal checks, tiny flash footprint
 static inline ComponentType parseComponentType(const char* t) {
   if (!t || !*t) return COMP_UNKNOWN;
@@ -616,9 +651,14 @@ bool makeLCD(Component& out, const String& payload) {
   out.pins[1] = a4;
   return true;
 }
-bool makeDHT(Component& out, int pin) {
+bool makeDHT(Component& out, int pin, const String& payload) {
+  const char* command = payload.c_str();
+  nextToken(&command);
+  nextToken(&command);
+  uint8_t type = nextToken(&command).asInt();
   if (!PinManager::reserve(pin, INPUT)) return false;
-  static DHT11 d(pin);
+  static DHT d(pin, type == 1 ? DHT11 : DHT22);  // persists after return
+  d.begin();
   tempSensor = &d;
   out = {};
   out.type = COMP_DHT;
@@ -936,7 +976,9 @@ bool cmdSense() {
     Serial.print(typeName(c.type));
     Serial.print(':');
     int pin = c.pins[0];
-    Serial.print(pin);
+    char officialPinName[6];
+    analogName(pin, officialPinName, sizeof(officialPinName));  // "A0"
+    Serial.print(officialPinName);
     Serial.print(':');
 
     switch (c.type) {
@@ -978,9 +1020,9 @@ bool cmdSense() {
         {
           float h = tempSensor->readHumidity();
           float t = tempSensor->readTemperature();
-          Serial.print(h, 1);
+          Serial.print(h);
           Serial.print('-');
-          Serial.print(t, 2);
+          Serial.print(t);
         }
         break;
 
@@ -1343,7 +1385,7 @@ bool handleRegister(const String& payload) {
 
     case COMP_SERVO: ok = makeServo(component, pin); break;
     case COMP_LCD: ok = makeLCD(component, payload); break;  // parses cols/rows/addr internally
-    case COMP_DHT: ok = makeDHT(component, pin); break;
+    case COMP_DHT: ok = makeDHT(component, pin, payload); break;
     case COMP_IR_TINY: ok = makeIRTiny(component, pin); break;
     case COMP_RFID_UART: ok = makeSoftUart(component, COMP_RFID_UART, payload); break;
     case COMP_BT_UART: ok = makeSoftUart(component, COMP_BT_UART, payload); break;
