@@ -1245,14 +1245,14 @@ bool commandLedMatrix(Component& component, const String& payload) {
     return true;
   }
 
-  ledMatrix->setRow(0, 0, nextToken(&command).asInt());
-  ledMatrix->setRow(0, 1, nextToken(&command).asInt());
-  ledMatrix->setRow(0, 2, nextToken(&command).asInt());
-  ledMatrix->setRow(0, 3, nextToken(&command).asInt());
-  ledMatrix->setRow(0, 4, nextToken(&command).asInt());
-  ledMatrix->setRow(0, 5, nextToken(&command).asInt());
-  ledMatrix->setRow(0, 6, nextToken(&command).asInt());
-  ledMatrix->setRow(0, 7, nextToken(&command).asInt());
+  ledMatrix->setColumn(0, 0, nextToken(&command).asInt());
+  ledMatrix->setColumn(0, 1, nextToken(&command).asInt());
+  ledMatrix->setColumn(0, 2, nextToken(&command).asInt());
+  ledMatrix->setColumn(0, 3, nextToken(&command).asInt());
+  ledMatrix->setColumn(0, 4, nextToken(&command).asInt());
+  ledMatrix->setColumn(0, 5, nextToken(&command).asInt());
+  ledMatrix->setColumn(0, 6, nextToken(&command).asInt());
+  ledMatrix->setColumn(0, 7, nextToken(&command).asInt());
   return true;
 }
 
